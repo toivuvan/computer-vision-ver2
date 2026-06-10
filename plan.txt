@@ -1,0 +1,253 @@
+Kế hoạch chi tiết: FCOS + ConvNeXt-Tiny
+Tổng quan kiến trúc
+Input (416×416×3)
+       ↓
+ConvNeXt-Tiny (pretrained ImageNet)
+       ↓
+FPN (3 scales: P3, P4, P5)
+       ↓
+FCOS Shared Head
+       ↓
+Output: cls_score × centerness + bbox (l,t,r,b)
+       ↓
+Soft-NMS → predictions.json
+
+1. Cấu trúc thư mục đề xuất
+my_submission/
+├── models/
+│   ├── backbone.py        # ConvNeXt-Tiny wrapper
+│   ├── fpn.py             # Feature Pyramid Network
+│   ├── fcos_head.py       # Detection head
+│   ├── fcos.py            # Model tổng hợp
+│   └── best.pth           # Saved weights
+├── utils/
+│   ├── dataset.py         # DataLoader + augmentation
+│   ├── loss.py            # Focal + CIoU + BCE centerness
+│   ├── nms.py             # Soft-NMS
+│   └── assign.py          # Positive/negative assignment
+├── train.py
+├── predict.py
+├── README.md
+└── requirements.txt
+
+2. Backbone: ConvNeXt-Tiny
+Thông số
+Stage 0 + Stage 1: stride 4  → 96ch,  104×104 [không dùng trực tiếp]
+Stage 2:           stride 8  → 192ch, 52×52   → C3 ✓
+Stage 3:           stride 16 → 384ch, 26×26   → C4 ✓
+Stage 4:           stride 32 → 768ch, 13×13   → C5 ✓
+Cách load
+python# torchvision.models.convnext_tiny(pretrained=True)
+# Lấy output của stage 2, 3, 4
+# Trả về dict: {"c3": tensor, "c4": tensor, "c5": tensor}
+Freeze strategy
+Epoch 0-4   : Freeze toàn bộ backbone
+Epoch 5-10  : Unfreeze Stage 3, 4
+Epoch 11+   : Unfreeze toàn bộ, LR backbone = LR_head × 0.1
+
+3. FPN — Feature Pyramid Network
+Kiến trúc chi tiết
+C3 (192ch, 52×52) ──→ Lateral Conv 1×1 → 256ch ──┐
+                                                    ↓
+C4 (384ch, 26×26) ──→ Lateral Conv 1×1 → 256ch → Add → Upsample(×2) ─→ P3 (256ch, 52×52)
+                                                    ↓
+C5 (768ch, 13×13) ──→ Lateral Conv 1×1 → 256ch → Add → Upsample(×2) ─→ P4 (256ch, 26×26)
+                                                    ↓
+                                               Output Conv 3×3 ────────→ P5 (256ch, 13×13)
+Sau mỗi merge → 3×3 Conv để smooth feature
+Top-down pathway:
+P5 = output_conv(lateral(C5))
+P4 = output_conv(lateral(C4) + upsample(P5))
+P3 = output_conv(lateral(C3) + upsample(P4))
+Scale assignment cho FCOS
+ScaleStridePhụ trách object sizeP380 – 64 pxP41664 – 128 pxP532128 – ∞ px
+
+4. FCOS Detection Head
+Kiến trúc
+P3/P4/P5 (256ch)
+      ↓
+┌─────────────────────────────────────────────┐
+│           Shared Weights Head               │
+│  4× (Conv 3×3 → GroupNorm(32) → ReLU)      │
+└──────────────┬──────────────────────────────┘
+               │
+       ┌───────┴────────┐
+       ↓                ↓
+ Cls Branch        Reg Branch
+ Conv 3×3          Conv 3×3
+       ↓                ↓
+ 5 class scores    4 offsets (l,t,r,b)
+ + 1 centerness    exp(·) để đảm bảo dương
+Scale factor
+Mỗi FPN scale có learnable scalar s_i (khởi tạo = 1.0):
+reg_output = exp(s_i × raw_output)
+Giúp ổn định training khi các scale có magnitude khác nhau
+Centerness target
+centerness* = sqrt(
+    min(l*, r*) / max(l*, r*)  ×  min(t*, b*) / max(t*, b*)
+)
+
+5. Positive/Negative Assignment
+Thuật toán gán nhãn (không cần anchor)
+Với mỗi pixel (i,j) tại scale P_k:
+
+Bước 1 - Kiểm tra nằm trong bbox nào:
+  → Tính (l, t, r, b) = (x-xmin, y-ymin, xmax-x, ymax-y)
+  → Nếu l,t,r,b > 0: pixel nằm trong bbox đó
+
+Bước 2 - Kiểm tra scale phù hợp:
+  → max(l,t,r,b) phải nằm trong range của P_k
+  → P3: [0, 64], P4: [64, 128], P5: [128, ∞]
+
+Bước 3 - Xử lý ambiguity (pixel trong nhiều bbox):
+  → Chọn bbox có diện tích nhỏ nhất
+
+Bước 4 - Center sampling (quan trọng):
+  → Pixel phải nằm trong vùng trung tâm của bbox
+  → radius = 1.5 × stride
+  → Giảm noise từ các pixel ở viền bbox
+Tỉ lệ pos/neg điển hình
+~5-15% pixels là positive → cần Focal Loss để balance
+
+6. Hàm mất mát
+Tổng loss
+L = (1/N_pos) × [L_cls + λ_reg × L_reg + λ_ctr × L_centerness]
+
+N_pos = tổng số positive pixels
+λ_reg = 1.0
+λ_ctr = 1.0
+Chi tiết từng thành phần
+Focal Loss (Classification):
+FL(p) = -α(1-p)^γ × log(p)
+α = 0.25, γ = 2.0
+
+Tính trên TẤT CẢ pixels (cả pos lẫn neg)
+Target: one-hot vector 5 classes cho positive
+        zero vector cho negative
+CIoU Loss (Regression):
+CIoU = 1 - IoU + ρ²(b, b*)/c² + αv
+
+v = (4/π²)(arctan(w*/h*) - arctan(w/h))²
+α = v / (1 - IoU + v)
+
+Chỉ tính trên positive pixels
+BCE Centerness Loss:
+L_ctr = BCE(centerness_pred, centerness_target)
+Chỉ tính trên positive pixels
+
+7. Augmentation Pipeline
+Train augmentation (theo thứ tự)
+Bước 1 — Mosaic (p=0.5 đầu, tăng dần p=0.8)
+  → Ghép 4 ảnh ngẫu nhiên thành lưới 2×2
+  → Output size: 832×832 → crop về 416×416
+  → Cập nhật bbox theo crop
+
+Bước 2 — Random Scale
+  → Scale ngẫu nhiên trong [0.5, 1.5]
+  → Letterbox padding về 416×416
+
+Bước 3 — Random Horizontal Flip (p=0.5)
+  → Flip ảnh + flip bbox (xmin/xmax đổi chỗ)
+
+Bước 4 — Color Jitter
+  → brightness=0.4, contrast=0.4
+  → saturation=0.4, hue=0.1
+
+Bước 5 — Random Grayscale (p=0.1)
+
+Bước 6 — Normalize
+  → mean=[0.485, 0.456, 0.406]
+  → std=[0.229, 0.224, 0.225]
+Val/Test augmentation
+Letterbox resize → 416×416 → Normalize
+(Không augment, chỉ resize + normalize)
+
+8. Chiến lược huấn luyện chi tiết
+Hyperparameters
+Input size:      416×416
+Batch size:      16 (GPU 8GB) / 32 (GPU 16GB)
+Total epochs:    100
+Optimizer:       AdamW
+Weight decay:    1e-4
+Gradient clip:   max_norm = 10.0
+Early stopping:  patience = 15, min_epochs = 30, min_delta = 1e-4
+Learning rate schedule
+Epoch 0-4   : Linear warmup, LR: 0 → 1e-3
+              Backbone frozen
+
+Epoch 5-49  : CosineAnnealingLR
+              LR head:     1e-3 → 1e-4
+              LR backbone: 1e-4 → 1e-5 (unfreeze từng phần)
+
+Epoch 50-84 : CosineAnnealingLR tiếp
+              LR head:     1e-4 → 1e-5
+              LR backbone: 1e-5 → 1e-6
+
+Epoch 85-100: Fine-tune stage
+              Tắt Mosaic augmentation
+              LR cố định = 1e-5
+              Chỉ flip + color jitter nhẹ
+EMA (Exponential Moving Average)
+decay = 0.9999
+ema_weights = decay × ema_weights + (1-decay) × model_weights
+
+→ Update sau mỗi batch
+→ Dùng EMA weights để evaluate và lưu best model
+→ Tăng ~0.5-1.5% mAP so với model gốc
+Checkpoint strategy
+Mỗi epoch: evaluate trên val set bằng EMA model
+Lưu best.pth khi mAP@0.5 cải thiện
+Lưu last.pth sau mỗi epoch (để resume)
+Dừng sớm nếu mAP validation không cải thiện sau patience epoch và đã qua min_epochs
+
+9. Inference Pipeline
+Decode predictions
+Với mỗi pixel (i, j) tại scale P_k (stride s):
+
+x_center = (j + 0.5) × s
+y_center = (i + 0.5) × s
+
+xmin = x_center - l
+ymin = y_center - t
+xmax = x_center + r
+ymax = y_center + b
+
+score = sigmoid(cls_score) × sigmoid(centerness)
+Post-processing
+Bước 1: score > threshold_conf (= 0.05 khi test)
+Bước 2: Map bbox về tọa độ ảnh gốc bằng letterbox inverse
+Bước 3: Clip bbox về [0, W] × [0, H]
+Bước 4: Loại bbox có w<1 hoặc h<1
+Bước 5: Class-wise Soft-NMS
+         sigma=0.5, score_threshold=0.001
+Bước 6: Lấy top-100 predictions per image
+Soft-NMS
+Thay vì xóa box chồng nhau:
+score_i = score_i × exp(-IoU(box_i, box_best)² / sigma)
+
+Tốt hơn hard NMS khi:
+- Nhiều người đứng gần nhau
+- Nhiều ghế xếp hàng
+
+10. Kỳ vọng mAP từng giai đoạn
+Giai đoạn hoàn thànhmAP@0.5ConvNeXt-Tiny + FPN 3 scale0.65 - 0.70+ FCOS head + CIoU + Focal0.72 - 0.78+ Centerness + center sampling0.76 - 0.81+ Mosaic + color jitter0.81 - 0.86+ EMA + fine-tune stage0.85 - 0.90+ Soft-NMS + threshold tuning0.87 - 0.92
+
+11. Checklist kiểm tra từng module
+□ Backbone lấy đúng C3/C4/C5 (kiểm tra shape)
+□ FPN output P3/P4/P5 đều là 256ch
+□ Assignment đúng: positive pixels nằm trong bbox
+□ Centerness target ∈ [0, 1]
+□ CIoU loss không NaN (clip IoU về [0, 1])
+□ Focal loss normalize đúng (chia N_pos)
+□ EMA update đúng sau mỗi batch
+□ Letterbox inverse đúng khi decode về ảnh gốc
+□ Soft-NMS chạy per-class
+□ predictions.json đúng format
+
+Tóm tắt ưu tiên cài đặt
+Sprint 1: Backbone + FPN + forward pass chạy được
+Sprint 2: Assignment + Loss tính đúng (verify bằng toy example)
+Sprint 3: Train loop + EMA + checkpoint
+Sprint 4: Augmentation (Mosaic sau cùng)
+Sprint 5: Inference + Soft-NMS + evaluate
+Sprint 6: Fine-tune stage + threshold tuning
