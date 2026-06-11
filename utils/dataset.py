@@ -45,6 +45,11 @@ class DetectionDataset(Dataset):
         self.augment = augment
         self.mosaic_enabled = True
         self.mosaic_prob = 0.5
+        self.random_scale_enabled = True
+        self.color_jitter_enabled = True
+        self.grayscale_enabled = True
+        self.flip_prob = 0.5
+        self.color_jitter_prob = 0.5
 
         # Load annotations
         with open(annotation_path, "r", encoding="utf-8") as f:
@@ -71,11 +76,27 @@ class DetectionDataset(Dataset):
     def set_epoch(self, epoch):
         if not self.augment:
             return
-        if epoch >= 85:
+        if epoch < 5:
             self.mosaic_enabled = False
-            return
-        # Ramp mosaic probability from 0.5 to 0.8 during the main training stage.
-        self.mosaic_prob = min(0.8, 0.5 + 0.3 * (epoch / 84.0))
+            self.random_scale_enabled = False
+            self.color_jitter_enabled = True
+            self.grayscale_enabled = False
+            self.flip_prob = 0.5
+            self.color_jitter_prob = 0.5
+        elif epoch < 45:
+            self.mosaic_enabled = True
+            self.mosaic_prob = 0.8
+            self.random_scale_enabled = True
+            self.color_jitter_enabled = True
+            self.grayscale_enabled = True
+            self.flip_prob = 0.5
+            self.color_jitter_prob = 0.5
+        else:
+            self.mosaic_enabled = False
+            self.random_scale_enabled = False
+            self.color_jitter_enabled = False
+            self.grayscale_enabled = False
+            self.flip_prob = 0.25
 
     def load_image_and_boxes(self, index):
         img_info = self.images[index]
@@ -254,7 +275,7 @@ class DetectionDataset(Dataset):
         else:
             # Load standard image with letterboxing
             img, bboxes, labels, orig_size, img_id = self.load_image_and_boxes(index)
-            if self.augment:
+            if self.augment and self.random_scale_enabled:
                 img, bboxes = self.random_scale_letterbox(img, bboxes)
             else:
                 # Apply letterbox
@@ -269,7 +290,7 @@ class DetectionDataset(Dataset):
         # Apply standard augmentations
         if self.augment:
             # Random Horizontal Flip
-            if random.random() < 0.5:
+            if random.random() < self.flip_prob:
                 img = np.fliplr(img).copy()
                 if len(bboxes) > 0:
                     xmin_new = self.img_size - bboxes[:, 2]
@@ -278,18 +299,18 @@ class DetectionDataset(Dataset):
                     bboxes[:, 2] = xmax_new
 
             # Color Jitter (simple implementation in numpy)
-            if random.random() < 0.5:
+            if self.color_jitter_enabled and random.random() < self.color_jitter_prob:
                 # Brightness
                 factor = random.uniform(0.6, 1.4)
                 img = np.clip(img * factor, 0, 255).astype(np.uint8)
                 
-            if random.random() < 0.5:
+            if self.color_jitter_enabled and random.random() < self.color_jitter_prob:
                 # Contrast
                 factor = random.uniform(0.6, 1.4)
                 mean = img.mean(axis=(0, 1), keepdims=True)
                 img = np.clip((img - mean) * factor + mean, 0, 255).astype(np.uint8)
 
-            if random.random() < 0.5:
+            if self.color_jitter_enabled and random.random() < self.color_jitter_prob:
                 hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
                 hsv[:, :, 1] *= random.uniform(0.6, 1.4)
                 hsv[:, :, 0] += random.uniform(-18.0, 18.0)
@@ -297,7 +318,7 @@ class DetectionDataset(Dataset):
                 hsv[:, :, 1:] = np.clip(hsv[:, :, 1:], 0, 255)
                 img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
-            if random.random() < 0.1:
+            if self.grayscale_enabled and random.random() < 0.1:
                 gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
                 img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 

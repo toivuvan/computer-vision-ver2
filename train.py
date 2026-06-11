@@ -25,6 +25,13 @@ from utils.assign import FCOSLabelAssigner
 from utils.loss import FCOSWithCIoULoss
 from utils.nms import soft_nms
 
+WARMUP_EPOCHS = 5
+MAIN_END_EPOCH = 45
+DEFAULT_EPOCHS = 55
+HEAD_MAX_LR = 2e-3
+BACKBONE_MAX_LR = HEAD_MAX_LR * 0.1
+FINE_TUNE_LR = 1e-5
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train custom FCOS detector.")
     parser.add_argument("--train_data", default="./public/annotations/train.json")
@@ -32,16 +39,18 @@ def parse_args():
     parser.add_argument("--image_dir", default="./public/train/images")
     parser.add_argument("--val_image_dir", default="./public/val/images")
     parser.add_argument("--checkpoint_dir", default="./models/")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--img_size", type=int, default=416)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--early_stop_patience", type=int, default=15,
+    parser.add_argument("--early_stop_patience", type=int, default=10,
                         help="Stop training if validation mAP does not improve for this many epochs. Use 0 to disable.")
     parser.add_argument("--early_stop_min_delta", type=float, default=1e-4,
                         help="Minimum mAP improvement required to reset early stopping patience.")
-    parser.add_argument("--min_epochs", type=int, default=30,
+    parser.add_argument("--min_epochs", type=int, default=25,
                         help="Minimum number of epochs to run before early stopping can trigger.")
+    parser.add_argument("--ema_decay", type=float, default=0.9999,
+                        help="Final EMA decay. A warmup schedule is applied automatically at the start.")
     return parser.parse_args()
 
 def set_seed(seed):
@@ -52,56 +61,46 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 class ModelEMA:
-    def __init__(self, model, decay=0.9999):
+    def __init__(self, model, decay=0.9999, tau=2000):
         self.ema = copy.deepcopy(model)
         self.ema.eval()
         self.decay = decay
+        self.tau = tau
+        self.updates = 0
         for param in self.ema.parameters():
             param.requires_grad_(False)
 
     def update(self, model):
         with torch.no_grad():
+            self.updates += 1
+            decay = self.decay * (1.0 - math.exp(-self.updates / self.tau))
             msd = model.state_dict()
             esd = self.ema.state_dict()
             for k in msd:
                 if esd[k].dtype.is_floating_point:
-                    esd[k].mul_(self.decay).add_(msd[k].detach(), alpha=1.0 - self.decay)
+                    esd[k].mul_(decay).add_(msd[k].detach(), alpha=1.0 - decay)
 
-def adjust_learning_rate(optimizer, epoch, total_epochs=100):
-    # Warmup stage (epochs 0-4)
-    if epoch < 5:
-        lr_head = 1e-3 * (epoch + 1) / 5.0
+def set_phase_learning_rate(optimizer, epoch):
+    if epoch < WARMUP_EPOCHS:
+        lr_head = HEAD_MAX_LR * (epoch + 1) / WARMUP_EPOCHS
         lr_backbone = 0.0
-    # Unfreeze Stage 3 & 4 (epochs 5-10)
-    elif epoch < 11:
-        lr_head = 1e-3
-        lr_backbone = 1e-4
-    # Fine-tuning stage (epochs 85-100)
-    elif epoch >= 85:
-        lr_head = 1e-5
-        lr_backbone = 1e-6
-    # Cosine Annealing (epochs 11-84)
+    elif epoch >= MAIN_END_EPOCH:
+        lr_head = FINE_TUNE_LR
+        lr_backbone = 0.0
     else:
-        progress = (epoch - 11) / (85 - 11)
-        lr_head = 1e-4 + 0.5 * (1e-3 - 1e-4) * (1.0 + math.cos(math.pi * progress))
-        lr_backbone = 1e-5 + 0.5 * (1e-4 - 1e-5) * (1.0 + math.cos(math.pi * progress))
-        
+        lr_backbone = optimizer.param_groups[0]["lr"]
+        lr_head = optimizer.param_groups[1]["lr"]
+        return lr_head, lr_backbone
+
     optimizer.param_groups[0]["lr"] = lr_backbone
     optimizer.param_groups[1]["lr"] = lr_head
     return lr_head, lr_backbone
 
 def configure_backbone_gradients(model, epoch):
-    if epoch == 0:
-        # Freeze backbone completely
+    if epoch < WARMUP_EPOCHS or epoch >= MAIN_END_EPOCH:
         for param in model.backbone.parameters():
             param.requires_grad = False
-    elif epoch == 5:
-        # Unfreeze stage3 and stage4 of backbone
-        for name, param in model.backbone.named_parameters():
-            if "stage3" in name or "stage4" in name:
-                param.requires_grad = True
-    elif epoch == 11:
-        # Unfreeze entire backbone
+    else:
         for param in model.backbone.parameters():
             param.requires_grad = True
 
@@ -221,6 +220,13 @@ def evaluate_model(model, dataloader, assigner, classes, gt_data, val_image_info
                 classes=classes,
                 iou_threshold=0.5
             )
+            max_conf = max((pred["confidence"] for pred in normalized_preds), default=0.0)
+            print(
+                f"Validation predictions: {len(normalized_preds)} boxes, "
+                f"max_conf={max_conf:.4f}, "
+                f"micro_recall={eval_results.get('micro_recall', 0.0):.4f}, "
+                f"micro_precision={eval_results.get('micro_precision', 0.0):.4f}"
+            )
             return eval_results["mAP@0.5"]
         except Exception as e:
             print(f"Error in evaluate evaluation: {e}")
@@ -271,7 +277,7 @@ def main():
 
     # Load Model
     model = FCOS(num_classes=len(classes), pretrained=True).to(device)
-    ema = ModelEMA(model, decay=0.9999)
+    ema = ModelEMA(model, decay=args.ema_decay)
 
     # Label assigner & Loss
     assigner = FCOSLabelAssigner(img_size=args.img_size)
@@ -283,8 +289,21 @@ def main():
     
     optimizer = torch.optim.AdamW([
         {"params": backbone_params, "lr": 0.0},
-        {"params": head_params, "lr": 1e-3}
+        {"params": head_params, "lr": HEAD_MAX_LR}
     ], weight_decay=1e-4)
+
+    main_epochs = max(0, min(args.epochs, MAIN_END_EPOCH) - WARMUP_EPOCHS)
+    onecycle_scheduler = None
+    if main_epochs > 0:
+        onecycle_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=[BACKBONE_MAX_LR, HEAD_MAX_LR],
+            total_steps=main_epochs * len(train_loader),
+            pct_start=0.15,
+            anneal_strategy="cos",
+            div_factor=1.0,
+            final_div_factor=200.0
+        )
 
     # Ensure checkpoint directory exists
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -297,12 +316,13 @@ def main():
         train_dataset.set_epoch(epoch)
         # 1. Adjust gradients and LR
         configure_backbone_gradients(model, epoch)
-        lr_head, lr_backbone = adjust_learning_rate(optimizer, epoch, args.epochs)
-        
-        # Disable mosaic after epoch 85
-        if epoch == 85:
-            print("Disabling Mosaic augmentation for fine-tuning stage.")
-            train_dataset.mosaic_enabled = False
+        lr_head, lr_backbone = set_phase_learning_rate(optimizer, epoch)
+        if epoch == WARMUP_EPOCHS:
+            print("Starting main training phase: unfreezing backbone and enabling OneCycleLR.")
+            optimizer.param_groups[0]["lr"] = BACKBONE_MAX_LR
+            optimizer.param_groups[1]["lr"] = HEAD_MAX_LR
+        if epoch == MAIN_END_EPOCH:
+            print("Starting fine-tune phase: freezing backbone and disabling Mosaic/Random Scale.")
 
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
@@ -339,6 +359,8 @@ def main():
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             
             optimizer.step()
+            if onecycle_scheduler is not None and WARMUP_EPOCHS <= epoch < MAIN_END_EPOCH:
+                onecycle_scheduler.step()
 
             # Update EMA weights
             ema.update(model)
@@ -386,6 +408,7 @@ def main():
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "ema_state_dict": ema.ema.state_dict(),
+            "ema_updates": ema.updates,
             "optimizer_state_dict": optimizer.state_dict(),
             "best_map": best_map
         }, os.path.join(args.checkpoint_dir, "last.pth"))

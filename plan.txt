@@ -137,7 +137,7 @@ Chỉ tính trên positive pixels
 
 7. Augmentation Pipeline
 Train augmentation (theo thứ tự)
-Bước 1 — Mosaic (p=0.5 đầu, tăng dần p=0.8)
+Bước 1 — Mosaic (tắt trong warmup, bật p=0.8 ở epoch 5-44)
   → Ghép 4 ảnh ngẫu nhiên thành lưới 2×2
   → Output size: 832×832 → crop về 416×416
   → Cập nhật bbox theo crop
@@ -166,29 +166,29 @@ Letterbox resize → 416×416 → Normalize
 Hyperparameters
 Input size:      416×416
 Batch size:      16 (GPU 8GB) / 32 (GPU 16GB)
-Total epochs:    100
+Total epochs:    55
 Optimizer:       AdamW
 Weight decay:    1e-4
 Gradient clip:   max_norm = 10.0
-Early stopping:  patience = 15, min_epochs = 30, min_delta = 1e-4
+Early stopping:  patience = 10, min_epochs = 25, min_delta = 1e-4
 Learning rate schedule
-Epoch 0-4   : Linear warmup, LR: 0 → 1e-3
+Epoch 0-4   : Linear warmup, LR head: 0 → 2e-3
               Backbone frozen
 
-Epoch 5-49  : CosineAnnealingLR
-              LR head:     1e-3 → 1e-4
-              LR backbone: 1e-4 → 1e-5 (unfreeze từng phần)
+Epoch 5-44  : OneCycleLR
+              LR head max:     2e-3
+              LR backbone max: 2e-4
+              Backbone unfreeze toàn bộ
+              Mosaic p=0.8 + random scale + flip + color jitter
 
-Epoch 50-84 : CosineAnnealingLR tiếp
-              LR head:     1e-4 → 1e-5
-              LR backbone: 1e-5 → 1e-6
-
-Epoch 85-100: Fine-tune stage
-              Tắt Mosaic augmentation
-              LR cố định = 1e-5
-              Chỉ flip + color jitter nhẹ
+Epoch 45-54 : Fine-tune stage
+              Backbone frozen
+              Tắt Mosaic và Random Scale
+              LR head cố định = 1e-5
+              Chỉ flip nhẹ
 EMA (Exponential Moving Average)
 decay = 0.9999
+Áp dụng warmup decay trong các batch đầu để EMA bám model nhanh hơn, tránh validation dùng trọng số gần khởi tạo.
 ema_weights = decay × ema_weights + (1-decay) × model_weights
 
 → Update sau mỗi batch
