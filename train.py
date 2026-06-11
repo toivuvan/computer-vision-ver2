@@ -25,12 +25,12 @@ from utils.assign import FCOSLabelAssigner
 from utils.loss import FCOSWithCIoULoss
 from utils.nms import soft_nms
 
-WARMUP_EPOCHS = 5
-MAIN_END_EPOCH = 45
-DEFAULT_EPOCHS = 55
-HEAD_MAX_LR = 2e-3
+WARMUP_EPOCHS = 3
+MAIN_END_EPOCH = 28
+DEFAULT_EPOCHS = 35
+HEAD_MAX_LR = 1e-3
 BACKBONE_MAX_LR = HEAD_MAX_LR * 0.1
-FINE_TUNE_LR = 1e-5
+FINE_TUNE_LR = 5e-6
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train custom FCOS detector.")
@@ -51,6 +51,12 @@ def parse_args():
                         help="Minimum number of epochs to run before early stopping can trigger.")
     parser.add_argument("--ema_decay", type=float, default=0.9999,
                         help="Final EMA decay. A warmup schedule is applied automatically at the start.")
+    parser.add_argument("--plateau_switch_patience", type=int, default=3,
+                        help="Switch to fine-tune early if mAP improvement stays below the plateau delta for this many validations.")
+    parser.add_argument("--plateau_switch_min_delta", type=float, default=0.005,
+                        help="Minimum mAP improvement per epoch considered meaningful for main training.")
+    parser.add_argument("--earliest_fine_tune_epoch", type=int, default=13,
+                        help="Earliest epoch index where plateau-based fine-tune switching is allowed.")
     return parser.parse_args()
 
 def set_seed(seed):
@@ -80,11 +86,11 @@ class ModelEMA:
                 if esd[k].dtype.is_floating_point:
                     esd[k].mul_(decay).add_(msd[k].detach(), alpha=1.0 - decay)
 
-def set_phase_learning_rate(optimizer, epoch):
+def set_phase_learning_rate(optimizer, epoch, fine_tune_epoch):
     if epoch < WARMUP_EPOCHS:
         lr_head = HEAD_MAX_LR * (epoch + 1) / WARMUP_EPOCHS
         lr_backbone = 0.0
-    elif epoch >= MAIN_END_EPOCH:
+    elif epoch >= fine_tune_epoch:
         lr_head = FINE_TUNE_LR
         lr_backbone = 0.0
     else:
@@ -96,8 +102,8 @@ def set_phase_learning_rate(optimizer, epoch):
     optimizer.param_groups[1]["lr"] = lr_head
     return lr_head, lr_backbone
 
-def configure_backbone_gradients(model, epoch):
-    if epoch < WARMUP_EPOCHS or epoch >= MAIN_END_EPOCH:
+def configure_backbone_gradients(model, epoch, fine_tune_epoch):
+    if epoch < WARMUP_EPOCHS or epoch >= fine_tune_epoch:
         for param in model.backbone.parameters():
             param.requires_grad = False
     else:
@@ -310,18 +316,21 @@ def main():
 
     best_map = -float("inf")
     epochs_without_improvement = 0
+    fine_tune_epoch = min(MAIN_END_EPOCH, args.epochs)
+    plateau_epochs = 0
+    previous_val_map = None
 
     print("Starting training...")
     for epoch in range(args.epochs):
-        train_dataset.set_epoch(epoch)
+        train_dataset.set_epoch(epoch, warmup_epochs=WARMUP_EPOCHS, fine_tune_epoch=fine_tune_epoch)
         # 1. Adjust gradients and LR
-        configure_backbone_gradients(model, epoch)
-        lr_head, lr_backbone = set_phase_learning_rate(optimizer, epoch)
+        configure_backbone_gradients(model, epoch, fine_tune_epoch)
+        lr_head, lr_backbone = set_phase_learning_rate(optimizer, epoch, fine_tune_epoch)
         if epoch == WARMUP_EPOCHS:
             print("Starting main training phase: unfreezing backbone and enabling OneCycleLR.")
             optimizer.param_groups[0]["lr"] = BACKBONE_MAX_LR
             optimizer.param_groups[1]["lr"] = HEAD_MAX_LR
-        if epoch == MAIN_END_EPOCH:
+        if epoch == fine_tune_epoch:
             print("Starting fine-tune phase: freezing backbone and disabling Mosaic/Random Scale.")
 
         model.train()
@@ -359,7 +368,7 @@ def main():
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             
             optimizer.step()
-            if onecycle_scheduler is not None and WARMUP_EPOCHS <= epoch < MAIN_END_EPOCH:
+            if onecycle_scheduler is not None and WARMUP_EPOCHS <= epoch < fine_tune_epoch:
                 onecycle_scheduler.step()
 
             # Update EMA weights
@@ -389,6 +398,26 @@ def main():
         val_map = evaluate_model(ema.ema, val_loader, assigner, classes, gt_data, val_image_info, device)
         print(f"Validation mAP@0.5: {val_map:.4f}")
 
+        if WARMUP_EPOCHS <= epoch < fine_tune_epoch and previous_val_map is not None:
+            map_delta = val_map - previous_val_map
+            if map_delta < args.plateau_switch_min_delta:
+                plateau_epochs += 1
+            else:
+                plateau_epochs = 0
+            if (
+                args.plateau_switch_patience > 0
+                and epoch >= args.earliest_fine_tune_epoch
+                and plateau_epochs >= args.plateau_switch_patience
+            ):
+                fine_tune_epoch = epoch + 1
+                plateau_epochs = 0
+                print(
+                    f"Plateau detected: mAP delta < {args.plateau_switch_min_delta:.4f} "
+                    f"for {args.plateau_switch_patience} validation(s). "
+                    f"Switching to fine-tune at epoch {fine_tune_epoch}."
+                )
+        previous_val_map = val_map
+
         # Save checkpoint
         improved = val_map > best_map + args.early_stop_min_delta
         if improved:
@@ -410,7 +439,8 @@ def main():
             "ema_state_dict": ema.ema.state_dict(),
             "ema_updates": ema.updates,
             "optimizer_state_dict": optimizer.state_dict(),
-            "best_map": best_map
+            "best_map": best_map,
+            "fine_tune_epoch": fine_tune_epoch
         }, os.path.join(args.checkpoint_dir, "last.pth"))
 
         if (

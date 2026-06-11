@@ -73,17 +73,17 @@ class DetectionDataset(Dataset):
     def __len__(self):
         return len(self.images)
 
-    def set_epoch(self, epoch):
+    def set_epoch(self, epoch, warmup_epochs=3, fine_tune_epoch=28):
         if not self.augment:
             return
-        if epoch < 5:
+        if epoch < warmup_epochs:
             self.mosaic_enabled = False
             self.random_scale_enabled = False
             self.color_jitter_enabled = True
             self.grayscale_enabled = False
             self.flip_prob = 0.5
             self.color_jitter_prob = 0.5
-        elif epoch < 45:
+        elif epoch < fine_tune_epoch:
             self.mosaic_enabled = True
             self.mosaic_prob = 0.8
             self.random_scale_enabled = True

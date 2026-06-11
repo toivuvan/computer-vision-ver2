@@ -41,9 +41,9 @@ python# torchvision.models.convnext_tiny(pretrained=True)
 # Lấy output của stage 2, 3, 4
 # Trả về dict: {"c3": tensor, "c4": tensor, "c5": tensor}
 Freeze strategy
-Epoch 0-4   : Freeze toàn bộ backbone
-Epoch 5-10  : Unfreeze Stage 3, 4
-Epoch 11+   : Unfreeze toàn bộ, LR backbone = LR_head × 0.1
+Epoch 0-2   : Freeze toàn bộ backbone
+Epoch 3-27  : Unfreeze toàn bộ, LR backbone = LR_head × 0.1
+Epoch 28+   : Freeze backbone để fine-tune head
 
 3. FPN — Feature Pyramid Network
 Kiến trúc chi tiết
@@ -137,7 +137,7 @@ Chỉ tính trên positive pixels
 
 7. Augmentation Pipeline
 Train augmentation (theo thứ tự)
-Bước 1 — Mosaic (tắt trong warmup, bật p=0.8 ở epoch 5-44)
+Bước 1 — Mosaic (tắt trong warmup, bật p=0.8 ở epoch 3-27)
   → Ghép 4 ảnh ngẫu nhiên thành lưới 2×2
   → Output size: 832×832 → crop về 416×416
   → Cập nhật bbox theo crop
@@ -166,26 +166,27 @@ Letterbox resize → 416×416 → Normalize
 Hyperparameters
 Input size:      416×416
 Batch size:      16 (GPU 8GB) / 32 (GPU 16GB)
-Total epochs:    55
+Total epochs:    35
 Optimizer:       AdamW
 Weight decay:    1e-4
 Gradient clip:   max_norm = 10.0
 Early stopping:  patience = 10, min_epochs = 25, min_delta = 1e-4
 Learning rate schedule
-Epoch 0-4   : Linear warmup, LR head: 0 → 2e-3
+Epoch 0-2   : Linear warmup, LR head: 0 → 1e-3
               Backbone frozen
 
-Epoch 5-44  : OneCycleLR
-              LR head max:     2e-3
-              LR backbone max: 2e-4
+Epoch 3-27  : OneCycleLR
+              LR head max:     1e-3
+              LR backbone max: 1e-4
               Backbone unfreeze toàn bộ
               Mosaic p=0.8 + random scale + flip + color jitter
 
-Epoch 45-54 : Fine-tune stage
+Epoch 28-34 : Fine-tune stage
               Backbone frozen
               Tắt Mosaic và Random Scale
-              LR head cố định = 1e-5
+              LR head cố định = 5e-6
               Chỉ flip nhẹ
+              Nếu mAP tăng < 0.005 trong 3 validation liên tiếp sau epoch 13 thì chuyển fine-tune sớm
 EMA (Exponential Moving Average)
 decay = 0.9999
 Áp dụng warmup decay trong các batch đầu để EMA bám model nhanh hơn, tránh validation dùng trọng số gần khởi tạo.

@@ -47,19 +47,20 @@ python train.py \
   --image_dir ./public/train/images \
   --val_image_dir ./public/val/images \
   --checkpoint_dir ./models/ \
-  --epochs 55 \
+  --epochs 35 \
   --batch_size 16 \
   --early_stop_patience 10 \
   --min_epochs 25
 ```
 
 ### Các chiến lược tối ưu trong quá trình huấn luyện:
-- **Warmup**: Đóng băng backbone ở 5 epoch đầu và tăng tuyến tính learning rate head lên `2e-3`.
-- **OneCycleLR**: Dùng cho epoch 5-44 với LR backbone bằng `0.1 * LR head` để rút ngắn hội tụ.
+- **Warmup**: Đóng băng backbone ở 3 epoch đầu và tăng tuyến tính learning rate head lên `1e-3`.
+- **OneCycleLR**: Dùng cho epoch 3-27 với LR backbone bằng `0.1 * LR head` để rút ngắn hội tụ.
 - **EMA (Exponential Moving Average)**: Cập nhật trọng số trung bình động của mô hình giúp nâng cao độ chính xác kiểm thử thêm từ 0.5% - 1.5% mAP.
 - **EMA warmup**: Decay được tăng dần ở giai đoạn đầu để validation không bị kẹt ở trọng số khởi tạo.
-- **Unfreeze backbone**: Mở toàn bộ backbone từ epoch 5, sau đó freeze lại ở epoch 45 để fine-tune head ổn định hơn.
-- **55-epoch schedule**: 5 epoch warmup, 40 epoch main training, 10 epoch fine-tune.
+- **Unfreeze backbone**: Mở toàn bộ backbone từ epoch 3, sau đó freeze lại ở epoch 28 để fine-tune head ổn định hơn.
+- **Plateau switch**: Nếu mAP tăng dưới `0.005` trong 3 validation liên tiếp sau epoch 13, training tự chuyển fine-tune sớm.
+- **35-epoch schedule**: 3 epoch warmup, 25 epoch main training, 7 epoch fine-tune.
 - **Early stopping**: Dừng huấn luyện nếu mAP validation không cải thiện sau một số epoch nhất định, mặc định sau tối thiểu 25 epoch và patience 10.
 
 ---
