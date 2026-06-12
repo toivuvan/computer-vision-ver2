@@ -67,11 +67,23 @@ class DetectionDataset(Dataset):
             self.img_ann[img_id].append(ann)
 
         self.images = data["images"]
-        # Filter out images that do not exist (optional, safety check)
-        self.images = [img for img in self.images if os.path.exists(os.path.join(self.image_dir, img["file_name"].split("/")[-1]))]
+        # Filter out images that do not exist. Supports either an image folder
+        # or the public root containing train/images and val/images.
+        self.images = [img for img in self.images if self.resolve_image_path(img) is not None]
 
     def __len__(self):
         return len(self.images)
+
+    def resolve_image_path(self, img_info):
+        basename = img_info["file_name"].split("/")[-1]
+        candidates = [
+            os.path.join(self.image_dir, basename),
+            os.path.join(self.image_dir, img_info["file_name"]),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return None
 
     def set_epoch(self, epoch, warmup_epochs=3, fine_tune_epoch=28):
         if not self.augment:
@@ -101,9 +113,9 @@ class DetectionDataset(Dataset):
     def load_image_and_boxes(self, index):
         img_info = self.images[index]
         img_id = img_info["id"]
-        # Use only basename to find the image in the current images directory
-        basename = img_info["file_name"].split("/")[-1]
-        img_path = os.path.join(self.image_dir, basename)
+        img_path = self.resolve_image_path(img_info)
+        if img_path is None:
+            raise FileNotFoundError(f"Image not found for: {img_info['file_name']}")
         
         img = cv2.imread(img_path)
         if img is None:
