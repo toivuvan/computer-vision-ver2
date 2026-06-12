@@ -275,7 +275,7 @@ def main():
 
     # For validation helper
     if evaluate is not None:
-        with open(args.val_data, "r", encoding="utf-8") as f:
+        with open(args.val_data, "r", encoding="utf-8-sig") as f:
             gt_data = json.load(f)
         _, val_image_info = validate_ground_truth(gt_data)
     else:

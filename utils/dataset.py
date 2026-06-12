@@ -52,7 +52,7 @@ class DetectionDataset(Dataset):
         self.color_jitter_prob = 0.5
 
         # Load annotations
-        with open(annotation_path, "r", encoding="utf-8") as f:
+        with open(annotation_path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
 
         self.classes = data["classes"]
