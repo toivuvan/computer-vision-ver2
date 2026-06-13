@@ -4,11 +4,11 @@ Input (416×416×3)
        ↓
 ConvNeXt-Tiny (pretrained ImageNet)
        ↓
-FPN (3 scales: P3, P4, P5)
+YOLO-like PAN-FPN (3 scales: P3, P4, P5)
        ↓
 FCOS Shared Head
        ↓
-Output: cls_score × centerness + bbox (l,t,r,b)
+Output: class score + bbox (l,t,r,b)
        ↓
 Soft-NMS → predictions.json
 
@@ -17,12 +17,12 @@ my_submission/
 ├── models/
 │   ├── backbone.py        # ConvNeXt-Tiny wrapper
 │   ├── fpn.py             # Feature Pyramid Network
-│   ├── fcos_head.py       # Detection head
+│   ├── fcos_head.py       # YOLO-like decoupled detection head
 │   ├── fcos.py            # Model tổng hợp
 │   └── best.pth           # Saved weights
 ├── utils/
 │   ├── dataset.py         # DataLoader + augmentation
-│   ├── loss.py            # Focal + CIoU + BCE centerness
+│   ├── loss.py            # Focal + CIoU
 │   ├── nms.py             # Soft-NMS
 │   └── assign.py          # Positive/negative assignment
 ├── train.py
@@ -45,7 +45,7 @@ Epoch 0-2   : Freeze toàn bộ backbone
 Epoch 3-27  : Unfreeze toàn bộ, LR backbone = LR_head × 0.1
 Epoch 28+   : Freeze backbone để fine-tune head
 
-3. FPN — Feature Pyramid Network
+3. YOLO-like PAN-FPN — Feature Pyramid Network + Path Aggregation
 Kiến trúc chi tiết
 C3 (192ch, 52×52) ──→ Lateral Conv 1×1 → 256ch ──┐
                                                     ↓
@@ -56,13 +56,15 @@ C5 (768ch, 13×13) ──→ Lateral Conv 1×1 → 256ch → Add → Upsample(×
                                                Output Conv 3×3 ────────→ P5 (256ch, 13×13)
 Sau mỗi merge → 3×3 Conv để smooth feature
 Top-down pathway:
-P5 = output_conv(lateral(C5))
-P4 = output_conv(lateral(C4) + upsample(P5))
-P3 = output_conv(lateral(C3) + upsample(P4))
+P5 = C2PSA_lite(SPPF(lateral(C5)))
+P4_top = conv(concat(lateral(C4), upsample(P5)))
+P3 = conv(concat(lateral(C3), upsample(P4_top)))
+P4 = conv(concat(P4_top, downsample(P3)))
+P5 = conv(concat(P5, downsample(P4)))
 Scale assignment cho FCOS
 ScaleStridePhụ trách object sizeP380 – 64 pxP41664 – 128 pxP532128 – ∞ px
 
-4. FCOS Detection Head
+4. YOLO-like Decoupled Detection Head
 Kiến trúc
 P3/P4/P5 (256ch)
       ↓
@@ -77,15 +79,12 @@ P3/P4/P5 (256ch)
  Conv 3×3          Conv 3×3
        ↓                ↓
  5 class scores    4 offsets (l,t,r,b)
- + 1 centerness    exp(·) để đảm bảo dương
+ 4 offsets (l,t,r,b) với exp(·) × stride để đảm bảo dương
 Scale factor
 Mỗi FPN scale có learnable scalar s_i (khởi tạo = 1.0):
 reg_output = exp(s_i × raw_output)
 Giúp ổn định training khi các scale có magnitude khác nhau
-Centerness target
-centerness* = sqrt(
-    min(l*, r*) / max(l*, r*)  ×  min(t*, b*) / max(t*, b*)
-)
+Head không dùng objectness/centerness riêng; confidence là sigmoid(class score).
 
 5. Positive/Negative Assignment
 Thuật toán gán nhãn (không cần anchor)
@@ -111,11 +110,10 @@ Tỉ lệ pos/neg điển hình
 
 6. Hàm mất mát
 Tổng loss
-L = (1/N_pos) × [L_cls + λ_reg × L_reg + λ_ctr × L_centerness]
+L = (1/N_pos) × [L_cls + λ_reg × L_reg]
 
 N_pos = tổng số positive pixels
 λ_reg = 1.0
-λ_ctr = 1.0
 Chi tiết từng thành phần
 Focal Loss (Classification):
 FL(p) = -α(1-p)^γ × log(p)
@@ -131,9 +129,7 @@ v = (4/π²)(arctan(w*/h*) - arctan(w/h))²
 α = v / (1 - IoU + v)
 
 Chỉ tính trên positive pixels
-BCE Centerness Loss:
-L_ctr = BCE(centerness_pred, centerness_target)
-Chỉ tính trên positive pixels
+Không dùng BCE centerness trong YOLO-like head.
 
 7. Augmentation Pipeline
 Train augmentation (theo thứ tự)
@@ -142,8 +138,8 @@ Bước 1 — Mosaic (tắt trong warmup, bật p=0.8 ở epoch 3-27)
   → Output size: 832×832 → crop về 416×416
   → Cập nhật bbox theo crop
 
-Bước 2 — Random Scale
-  → Scale ngẫu nhiên trong [0.5, 1.5]
+Bước 2 — Random Scale / moderate LSJ
+  → Scale ngẫu nhiên trong [0.6, 1.8]
   → Letterbox padding về 416×416
 
 Bước 3 — Random Horizontal Flip (p=0.5)
@@ -179,7 +175,7 @@ Epoch 3-27  : OneCycleLR
               LR head max:     1e-3
               LR backbone max: 1e-4
               Backbone unfreeze toàn bộ
-              Mosaic p=0.8 + random scale + flip + color jitter
+              Mosaic p=0.8 + moderate LSJ + flip + color jitter + RandomErasing
 
 Epoch 28-34 : Fine-tune stage
               Backbone frozen
@@ -213,7 +209,7 @@ ymin = y_center - t
 xmax = x_center + r
 ymax = y_center + b
 
-score = sigmoid(cls_score) × sigmoid(centerness)
+score = sigmoid(cls_score)
 Post-processing
 Bước 1: score > threshold_conf (= 0.05 khi test)
 Bước 2: Map bbox về tọa độ ảnh gốc bằng letterbox inverse
@@ -231,13 +227,12 @@ Tốt hơn hard NMS khi:
 - Nhiều ghế xếp hàng
 
 10. Kỳ vọng mAP từng giai đoạn
-Giai đoạn hoàn thànhmAP@0.5ConvNeXt-Tiny + FPN 3 scale0.65 - 0.70+ FCOS head + CIoU + Focal0.72 - 0.78+ Centerness + center sampling0.76 - 0.81+ Mosaic + color jitter0.81 - 0.86+ EMA + fine-tune stage0.85 - 0.90+ Soft-NMS + threshold tuning0.87 - 0.92
+Giai đoạn hoàn thànhmAP@0.5ConvNeXt-Tiny + YOLO-like PAN-FPN0.65 - 0.72+ Decoupled head + CIoU + Focal0.72 - 0.80+ Center sampling assignment0.76 - 0.82+ Mosaic + color jitter + RandomErasing0.81 - 0.87+ EMA + fine-tune stage0.85 - 0.90+ Soft-NMS + threshold tuning0.87 - 0.92
 
 11. Checklist kiểm tra từng module
 □ Backbone lấy đúng C3/C4/C5 (kiểm tra shape)
-□ FPN output P3/P4/P5 đều là 256ch
+□ PAN-FPN output P3/P4/P5 đều là 256ch
 □ Assignment đúng: positive pixels nằm trong bbox
-□ Centerness target ∈ [0, 1]
 □ CIoU loss không NaN (clip IoU về [0, 1])
 □ Focal loss normalize đúng (chia N_pos)
 □ EMA update đúng sau mỗi batch
@@ -246,7 +241,7 @@ Giai đoạn hoàn thànhmAP@0.5ConvNeXt-Tiny + FPN 3 scale0.65 - 0.70+ FCOS hea
 □ predictions.json đúng format
 
 Tóm tắt ưu tiên cài đặt
-Sprint 1: Backbone + FPN + forward pass chạy được
+Sprint 1: Backbone + PAN-FPN + forward pass chạy được
 Sprint 2: Assignment + Loss tính đúng (verify bằng toy example)
 Sprint 3: Train loop + EMA + checkpoint
 Sprint 4: Augmentation (Mosaic sau cùng)

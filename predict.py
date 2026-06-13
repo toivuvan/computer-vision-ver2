@@ -100,9 +100,13 @@ def main():
             cls_logits = outputs["cls_logits"][0]       # M x C
             bbox_preds = outputs["bbox_preds"][0]       # M x 4 (l, t, r, b)
             centerness_logits = outputs["centerness_logits"][0] # M
+            has_centerness = outputs.get("has_centerness", True)
             
             # Compute classification scores
-            scores = torch.sigmoid(cls_logits) * torch.sigmoid(centerness_logits)[:, None]
+            if has_centerness:
+                scores = torch.sigmoid(cls_logits) * torch.sigmoid(centerness_logits)[:, None]
+            else:
+                scores = torch.sigmoid(cls_logits)
             max_scores, class_ids = scores.max(dim=1)
             
             # Keep predictions above confidence threshold

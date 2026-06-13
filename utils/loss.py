@@ -90,6 +90,7 @@ class FCOSWithCIoULoss(nn.Module):
         cls_logits = predictions["cls_logits"]
         bbox_preds = predictions["bbox_preds"]
         centerness_logits = predictions["centerness_logits"]
+        has_centerness = predictions.get("has_centerness", True)
 
         batch_size, num_locs, num_classes = cls_logits.shape
         device = cls_logits.device
@@ -126,12 +127,13 @@ class FCOSWithCIoULoss(nn.Module):
             # Box loss (CIoU)
             loss_reg = self._ciou_loss(pos_bbox_preds, pos_reg_targets).sum()
 
-            # Centerness loss (BCE)
-            pos_centerness_logits = flat_centerness_logits[pos_mask]
-            pos_centerness_targets = flat_centerness_targets[pos_mask]
-            loss_centerness = F.binary_cross_entropy_with_logits(
-                pos_centerness_logits, pos_centerness_targets, reduction="sum"
-            )
+            if has_centerness:
+                # Centerness loss (BCE)
+                pos_centerness_logits = flat_centerness_logits[pos_mask]
+                pos_centerness_targets = flat_centerness_targets[pos_mask]
+                loss_centerness = F.binary_cross_entropy_with_logits(
+                    pos_centerness_logits, pos_centerness_targets, reduction="sum"
+                )
 
         # Normalize by positive locations count to keep loss scale stable
         norm_factor = max(num_pos, 1.0)

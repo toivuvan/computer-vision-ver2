@@ -51,5 +51,6 @@ class FCOS(nn.Module):
         return {
             "cls_logits": cls_logits,
             "bbox_preds": bbox_preds,
-            "centerness_logits": centerness_logits
+            "centerness_logits": centerness_logits,
+            "has_centerness": False,
         }

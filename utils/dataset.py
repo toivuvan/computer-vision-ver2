@@ -242,7 +242,7 @@ class DetectionDataset(Dataset):
         return cropped_img, bboxes4, labels4
 
     def random_scale_letterbox(self, img, bboxes):
-        scale = random.uniform(0.5, 1.5)
+        scale = random.uniform(0.6, 1.8)
         h, w = img.shape[:2]
         scaled_w = max(1, int(round(w * scale)))
         scaled_h = max(1, int(round(h * scale)))

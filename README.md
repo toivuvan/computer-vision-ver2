@@ -1,6 +1,6 @@
 # Fully Convolutional One-Stage (FCOS) Object Detector with ConvNeXt-Tiny
 
-Mô hình phát hiện đối tượng anchor-free FCOS tự xây dựng từ đầu (from scratch) sử dụng mạng trích xuất đặc trưng ConvNeXt-Tiny và mạng kim tự tháp đặc trưng (FPN). Dự án hỗ trợ huấn luyện trên GPU T4 và suy luận hiệu quả.
+Mô hình phát hiện đối tượng anchor-free FCOS tự xây dựng từ đầu (from scratch) sử dụng mạng trích xuất đặc trưng ConvNeXt-Tiny và neck PAN-FPN kiểu YOLO-like. Dự án hỗ trợ huấn luyện trên GPU T4 và suy luận hiệu quả.
 
 ---
 
@@ -10,13 +10,13 @@ Mô hình phát hiện đối tượng anchor-free FCOS tự xây dựng từ đ
 my_submission/
 ├── models/
 │   ├── backbone.py        # Mạng trích xuất đặc trưng ConvNeXt-Tiny
-│   ├── fpn.py             # Feature Pyramid Network (FPN)
-│   ├── fcos_head.py       # Đầu dự đoán classification, regression, centerness
+│   ├── fpn.py             # YOLO-like PAN-FPN + SPPF + C2PSA-lite
+│   ├── fcos_head.py       # YOLO-like decoupled classification/regression head
 │   └── fcos.py            # Kết hợp Backbone + FPN + Head
 ├── utils/
 │   ├── dataset.py         # Bộ đọc dữ liệu + augmentation (Letterbox, Mosaic, Flip, Jitter)
 │   ├── assign.py          # Thuật toán gán nhãn pixel-wise (FCOS Assignment)
-│   ├── loss.py            # Tổ hợp Loss: Focal Loss + CIoU Loss + BCE Centerness
+│   ├── loss.py            # Tổ hợp Loss: Focal Loss + CIoU Loss
 │   └── nms.py             # Khử trùng hộp bao Soft-NMS (Class-wise)
 ├── train.py              # Script huấn luyện
 ├── predict.py            # Script suy luận
@@ -56,6 +56,7 @@ python train.py \
 ### Các chiến lược tối ưu trong quá trình huấn luyện:
 - **Warmup**: Đóng băng backbone ở 3 epoch đầu và tăng tuyến tính learning rate head lên `1e-3`.
 - **OneCycleLR**: Dùng cho epoch 3-27 với LR backbone bằng `0.1 * LR head` để rút ngắn hội tụ.
+- **YOLO-like neck/head**: Thay FPN thuần bằng PAN-FPN với SPPF và C2PSA-lite; head tách nhánh classification/regression với C3k2-lite.
 - **EMA (Exponential Moving Average)**: Cập nhật trọng số trung bình động của mô hình giúp nâng cao độ chính xác kiểm thử thêm từ 0.5% - 1.5% mAP.
 - **EMA warmup**: Decay được tăng dần ở giai đoạn đầu để validation không bị kẹt ở trọng số khởi tạo.
 - **Unfreeze backbone**: Mở toàn bộ backbone từ epoch 3, sau đó freeze lại ở epoch 28 để fine-tune head ổn định hơn.

@@ -126,6 +126,7 @@ def evaluate_model(model, dataloader, assigner, classes, gt_data, val_image_info
             cls_logits = outputs["cls_logits"]
             bbox_preds = outputs["bbox_preds"]
             centerness_logits = outputs["centerness_logits"]
+            has_centerness = outputs.get("has_centerness", True)
             
             # Decode for each image in batch
             batch_size = images.shape[0]
@@ -139,7 +140,10 @@ def evaluate_model(model, dataloader, assigner, classes, gt_data, val_image_info
                 img_centerness_logits = centerness_logits[b] # M
                 
                 # Apply sigmoid to get scores
-                scores = torch.sigmoid(img_cls_logits) * torch.sigmoid(img_centerness_logits)[:, None]
+                if has_centerness:
+                    scores = torch.sigmoid(img_cls_logits) * torch.sigmoid(img_centerness_logits)[:, None]
+                else:
+                    scores = torch.sigmoid(img_cls_logits)
                 max_scores, class_ids = scores.max(dim=1)
                 
                 # Keep confidence > 0.05
