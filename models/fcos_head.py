@@ -57,7 +57,8 @@ class FCOSHead(nn.Module):
     """YOLO11-like decoupled anchor-free head.
 
     It keeps the repository output contract: class logits and l/t/r/b distances.
-    Unlike the old FCOS head, it does not predict centerness/objectness.
+    The centerness branch predicts localization quality and is used to reduce
+    low-quality boxes during inference.
     """
 
     def __init__(self, in_channels=256, num_classes=5, strides=(8, 16, 32)):
@@ -69,6 +70,7 @@ class FCOSHead(nn.Module):
         self.reg_towers = nn.ModuleList()
         self.cls_preds = nn.ModuleList()
         self.reg_preds = nn.ModuleList()
+        self.centerness_preds = nn.ModuleList()
         self.scales = nn.ModuleList()
 
         for _ in strides:
@@ -82,15 +84,18 @@ class FCOSHead(nn.Module):
             ))
             self.cls_preds.append(nn.Conv2d(in_channels, num_classes, kernel_size=1))
             self.reg_preds.append(nn.Conv2d(in_channels, 4, kernel_size=1))
+            self.centerness_preds.append(nn.Conv2d(in_channels, 1, kernel_size=1))
             self.scales.append(Scale(1.0))
 
         prior_prob = 0.01
         bias_val = -math.log((1 - prior_prob) / prior_prob)
-        for cls_pred, reg_pred in zip(self.cls_preds, self.reg_preds):
+        for cls_pred, reg_pred, centerness_pred in zip(self.cls_preds, self.reg_preds, self.centerness_preds):
             nn.init.constant_(cls_pred.bias, bias_val)
             nn.init.normal_(cls_pred.weight, std=0.01)
             nn.init.constant_(reg_pred.bias, 0.0)
             nn.init.normal_(reg_pred.weight, std=0.01)
+            nn.init.constant_(centerness_pred.bias, 0.0)
+            nn.init.normal_(centerness_pred.weight, std=0.01)
 
     def forward(self, features):
         cls_scores = []
@@ -107,11 +112,6 @@ class FCOSHead(nn.Module):
             bbox_pred = torch.exp(reg_output).clamp(max=128.0) * float(self.strides[idx])
             bbox_preds.append(bbox_pred)
 
-            # Kept only for backward-compatible flattening code. Not used in loss/inference.
-            centerness_preds.append(torch.zeros(
-                x.shape[0], 1, x.shape[2], x.shape[3],
-                dtype=x.dtype,
-                device=x.device,
-            ))
+            centerness_preds.append(self.centerness_preds[idx](reg_feat))
 
         return cls_scores, bbox_preds, centerness_preds
